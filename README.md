@@ -1,18 +1,20 @@
-> :warning: This repository is not maintained and I am no longer hosting the game server. Feel free to create a fork.
+> :warning: This repository is not maintained and I never publicly hosted this game server. Feel free to create a fork.
 
 # SMB35
 
-A custom server for Super Mario Bros. 35
+A modified fork of [kinnay/SMB35](https://github.com/kinnay/SMB35),
+an open-source server for Super Mario Bros. 35.
 
-For the server-owned bot's lifecycle, tuning knobs, attack table, course selection, health/TTL model, retirement behavior, and deployment notes, see [the Bot Guide](BOT_GUIDE.md).
+## Changes in this fork
+- Configurable server-owned bot
+- Bot behavior modes and runtime support
+- Deployment and tuning guide in BOT_GUIDE.md
+- Host-specific settings kept out of version control
 
-~~To try it out, simply copy the patch folder into `/atmosphere/exefs_patches` and play the game. The patch redirects the game to `smb35.ymar.dev:20000`, which is where I am hosting the game server. It also disables all prepo and most bcat calls that are made by the game.~~
+## Upstream
+Based on [kinnay/SMB35](https://github.com/kinnay/SMB35). This is an
+independent personal fork, shared as-is and not under active development.
+Feel free to use it as a starting point or fork it for your own work.
 
-~~The dashboard is hosted at https://smb35.ymar.dev:20002. Here you can check out if anyone is currently playing the game.~~
-
-~~If you encounter any bugs, please submit an [issue](https://github.com/kinnay/SMB35/issues) or [pull request](https://github.com/kinnay/SMB35/pulls) on github.~~
-
-### Links
-* [Python package for game servers](https://github.com/kinnay/NintendoClients)
-* [Documentation about game servers](https://github.com/kinnay/NintendoClients/wiki)
-* [Documentation about the relay server](https://github.com/kinnay/NintendoClients/wiki/Eagle-Protocol)
+## License
+GPL-3.0. See LICENSE.
