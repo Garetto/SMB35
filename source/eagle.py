@@ -1,5 +1,7 @@
 
 from anynet import util, http, websocket, streams
+import config
+import bot_runtime
 import contextlib
 import secrets
 import hashlib
@@ -45,6 +47,36 @@ class State:
 	DISCONNECTED = 4
 
 
+def describe_join_match(payload):
+	"""Return the documented SMB35 RPC 26 fields for diagnostic logging.
+
+	This deliberately only decodes the on-wire record.  It does not validate or
+	change a player profile, and is enabled only with ``EAGLE_TRACE``.  A known
+	good second retail client and the server bot can therefore be compared field
+	for field from the same server log.
+	"""
+	# 7 + 8 + 32 + 1 + 64 + (8 * 33) + 16 + 16 + 2 + 1 bits, rounded up.
+	if len(payload) != 52:
+		return "invalid_length=%i expected=52 raw=%s" %(len(payload), payload.hex())
+
+	stream = streams.BitStreamIn(payload, ">")
+	player_id = stream.bits(7)
+	requested_level = stream.bits(8)
+	coins = stream.bits(32)
+	is_luigi = stream.bit()
+	principal_id = stream.bits(64)
+	name = stream.ascii(33).split("\0", 1)[0]
+	coin_level = stream.bits(16)
+	unknown16 = stream.bits(16)
+	item = stream.bits(2)
+	unknown1 = stream.bit()
+	return (
+		"player=%i level=%i coins=%i luigi=%i pid=%i name=%r "
+		"coin_level=%i unknown16=%i item=%i unknown1=%i"
+	) %(player_id, requested_level, coins, is_luigi, principal_id, name,
+		coin_level, unknown16, item, unknown1)
+
+
 def parse_token(token, server_id):
 	token = json.loads(base64.b64decode(token).decode())
 	if token["version"] != 1:
@@ -76,6 +108,8 @@ class EagleClient:
 		
 		self.state = State.LOGIN_PHASE0
 		self.token = ""
+		self.user_id = None
+		self.is_server_bot = False
 	
 	async def process(self):
 		await self.send_accepted()
@@ -163,6 +197,7 @@ class EagleClient:
 		self.token += stream.ascii(stream.bits(8))
 		if last_fragment:
 			user_id = parse_token(self.token, self.server.session_id)
+			self.user_id = user_id
 			await self.send_login_result(user_id + "\0")
 			
 			self.state = State.WAIT_READY
@@ -260,14 +295,50 @@ class EagleClient:
 			await self.server.remove_node(self)
 
 
+class VirtualEagleClient:
+	"""A server-owned logical Eagle node used by a configured bot mode.
+
+	It implements the small subset of ``EagleClient`` that the relay needs.
+	There is intentionally no socket behind it: the server can announce it as a
+	peer and later use its node id as an RPC source without a fake login/token.
+	"""
+
+	is_virtual = True
+	state = State.READY
+
+	def __init__(self, node_id):
+		self.node_id = node_id
+
+	async def send_node_added(self, node_id):
+		pass
+
+	async def send_node_removed(self, node_id):
+		pass
+
+	async def send_rpc(self, source_id, rpc_id, payload):
+		# Gameplay simulation is added only after the SMB35 RPC payloads are
+		# captured and verified.  A virtual node currently receives nothing.
+		pass
+
+
 class EagleServer:
-	def __init__(self, router, session_id):
+	def __init__(
+		self, router, task_group, session_id, bot_mode=None,
+		nex_settings=None, nex_host=None
+	):
 		self.router = router
+		self.task_group = task_group
 		self.session_id = session_id
+		self.bot_mode = bot_mode
+		self.bots = bot_runtime.BotRuntime(
+			self, bot_mode, nex_settings, nex_host
+		) if bot_mode else None
 		self.clients = {}
+		self.bot_user_ids = set()
 		self.node_id = 0
+		self.bot_nodes_added = False
 		
-		self.close_request = anyio.create_event()
+		self.close_request = anyio.Event()
 		
 		self.counters = [0] * 32
 		
@@ -283,28 +354,99 @@ class EagleServer:
 			await self.close_request.wait()
 	
 	async def stop(self):
-		await self.close_request.set()
+		if self.bots:
+			await self.bots.stop()
+		self.close_request.set()
 		
 	async def handle(self, client):
 		self.node_id += 1
+		while self.node_id in self.clients:
+			self.node_id += 1
 		if self.node_id < M:
 			client = EagleClient(self, client, self.node_id)
-			with util.catch(Exception):
+			try:
 				await client.process()
-			await self.remove_node(client)
+			except Exception:
+				logger.exception("Eagle client node=%i ended with an exception", client.node_id)
+			finally:
+				await self.remove_node(client)
 	
 	async def mark_ready(self, client):
+		client.is_server_bot = client.user_id in self.bot_user_ids
 		self.clients[client.node_id] = client
-		
 		await client.send_all_nodes(self.clients)
 		
 		for other in list(self.clients.values()):
 			if other != client:
 				await other.send_node_added(client.node_id)
+
+		# Let every genuine player receive its normal consecutive Eagle node id
+		# before placing bots immediately after them. SMB35 ties node 2 to player
+		# id 1 in its JoinMatch flow; arbitrary high node ids do not work here.
+		real_ready = sum(
+			1 for other in self.clients.values()
+			if not getattr(other, "is_virtual", False)
+			and not getattr(other, "is_server_bot", False)
+		)
+		if self.bot_mode and real_ready == self.bots.real_player_count:
+			self.bots.note_real_eagle_ready()
+
+	def make_bot_token(self, principal_id):
+		"""Create a short-lived token for the local Eagle bot peer."""
+
+		user_id = "%016x" %principal_id
+		self.bot_user_ids.add(user_id)
+		payload = {
+			"expires_at": "%i" %(time.time() + 300),
+			"server_env": "lp1",
+			"server_id": "%i" %self.session_id,
+			"user_id": user_id
+		}
+		signature = hmac.digest(
+			SIGNATURE_KEY, json.dumps(payload).encode(), hashlib.sha256
+		)
+		token = {
+			"payload": payload,
+			"signature": base64.b64encode(signature).decode(),
+			"version": 1
+		}
+		return base64.b64encode(json.dumps(token).encode()).decode()
+
+	async def add_virtual_nodes(self):
+		"""Populate an opted-in session with server-owned lobby opponents."""
+
+		count = self.bot_mode.bot_count
+		if not 0 < count < M:
+			raise ValueError("Bot count must be between 1 and %i" %(M - 1))
+
+		# SMB35's player id is zero-based while Eagle's node id is one-based.
+		# For example, the verified second human peer was player 1 / node 2.
+		first_node_id = self.bots.player_offset + 1
+		node_ids = []
+		for node_id in range(first_node_id, first_node_id + count):
+			if node_id in self.clients:
+				raise RuntimeError("Bot node id is already in use: %i" %node_id)
+			self.clients[node_id] = VirtualEagleClient(node_id)
+			self.bots.add_node(node_id, node_id - first_node_id)
+			node_ids.append(node_id)
+
+		self.bot_nodes_added = True
+		logger.info(
+			"Added %i virtual Eagle nodes to session=%i mode=%s",
+			count,
+			self.session_id,
+			self.bot_mode.name
+		)
+		return node_ids
 	
 	async def remove_node(self, client):
 		if client.node_id in self.clients:
 			del self.clients[client.node_id]
+			logger.info(
+				"EAGLE_NODE_REMOVED session=%i node=%i server_bot=%s",
+				self.session_id, client.node_id,
+				getattr(client, "is_server_bot", False)
+			)
 			
 			for other in list(self.clients.values()):
 				await other.send_node_removed(client.node_id)
@@ -314,12 +456,56 @@ class EagleServer:
 			targets = [c.node_id for c in self.clients.values() if c.state == State.READY and c != source]
 		elif targets == [M + 1]:
 			targets = [c.node_id for c in self.clients.values() if c.state == State.READY]
+
+		if config.EAGLE_TRACE:
+			limit = config.EAGLE_TRACE_HEX_BYTES
+			preview = payload[:limit].hex()
+			suffix = "..." if len(payload) > limit else ""
+			logger.info(
+				"EAGLE_TRACE session=%i source=%i rpc=%i targets=%s bytes=%i payload=%s%s",
+				self.session_id, source.node_id, rpc_id, targets, len(payload), preview, suffix
+			)
+			if rpc_id == 26:
+				logger.info(
+					"EAGLE_JOIN_MATCH session=%i source=%i %s",
+					self.session_id, source.node_id, describe_join_match(payload)
+				)
 		
 		for target in targets:
 			if target == 0:
 				await self.process_rpc(source, rpc_id, payload)
 			elif target in self.clients:
 				await self.clients[target].send_rpc(source.node_id, rpc_id, payload)
+
+		if self.bots and not getattr(source, "is_virtual", False) and not getattr(source, "is_server_bot", False):
+			await self.bots.observe_real_rpc(rpc_id, payload)
+
+	async def send_from_bot(self, bot, rpc_id, payload):
+		"""Relay a server-owned bot packet to every currently-ready real client."""
+		if config.EAGLE_TRACE:
+			limit = config.EAGLE_TRACE_HEX_BYTES
+			preview = payload[:limit].hex()
+			suffix = "..." if len(payload) > limit else ""
+			logger.info(
+				"BOT_RPC session=%i source=%i player=%i rpc=%i bytes=%i payload=%s%s",
+				self.session_id, bot.node_id, bot.player_id, rpc_id, len(payload), preview, suffix
+			)
+
+		for client in self.clients.values():
+			if not getattr(client, "is_virtual", False) and client.state == State.READY:
+				await client.send_rpc(bot.node_id, rpc_id, payload)
+
+	async def send_bot_to_server(self, bot, rpc_id, payload):
+		"""Deliver a virtual bot's server-directed RPC through the normal path."""
+
+		client = self.clients.get(bot.node_id)
+		if client is None or not getattr(client, "is_virtual", False):
+			raise RuntimeError("Bot node is not available: %i" %bot.node_id)
+		await self.relay_rpc(client, [0], rpc_id, payload)
+
+	def set_bot_player_offset(self, real_player_count):
+		if self.bots:
+			self.bots.set_player_offset(real_player_count)
 	
 	async def process_rpc(self, client, rpc_id, payload):
 		logger.info("Received RPC: %i", rpc_id)
@@ -357,25 +543,56 @@ class EagleServer:
 
 
 class EagleMgr:
-	def __init__(self, router, group):
+	def __init__(self, router, group, nex_settings, nex_host):
 		self.router = router
 		self.group = group
+		self.nex_settings = nex_settings
+		self.nex_host = nex_host
 		
 		self.servers = {}
 		
-	async def start(self, session_id):
-		server = EagleServer(self.router, session_id)
+	async def start(self, session_id, bot_mode=None):
+		server = EagleServer(
+			self.router, self.group, session_id, bot_mode,
+			self.nex_settings, self.nex_host
+		)
 		self.servers[session_id] = server
 		
-		await self.group.spawn(server.start)
+		self.group.start_soon(server.start)
 		
 	async def stop(self, session_id):
 		server = self.servers.pop(session_id)
 		await server.stop()
 
+	async def dismiss_bots_before_round(self, session_id):
+		"""Stop prepared bots without stopping the human Eagle session."""
+
+		server = self.servers[session_id]
+		if server.bots:
+			await server.bots.stop()
+
+	def set_bot_player_offset(self, session_id, real_player_count):
+		self.servers[session_id].set_bot_player_offset(real_player_count)
+
+	async def prepare_bots(self, session_id):
+		server = self.servers[session_id]
+		if not server.bots:
+			return []
+		return await server.bots.prepare_nex()
+
+	async def prepare_bot_round(self, session_id, round_id):
+		server = self.servers[session_id]
+		if server.bots:
+			await server.bots.prepare_round(round_id)
+
+	async def begin_bot_matchmaking(self, session_id, param):
+		server = self.servers[session_id]
+		if server.bots:
+			await server.bots.begin_matchmaking(param)
+
 
 @contextlib.asynccontextmanager
-async def serve(host, port, context):
+async def serve(host, port, context, nex_settings, nex_host):
 	async with http.serve_router(host, port, context) as router:
 		async with util.create_task_group() as group:
-			yield EagleMgr(router, group)
+			yield EagleMgr(router, group, nex_settings, nex_host)

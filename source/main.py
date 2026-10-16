@@ -15,15 +15,19 @@ import json
 import math
 
 import dashboard
+import bot_modes
 import config
 import eagle
 
 import logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 SERVER_PID = 257049437023956657
 SERVER_KEY = secrets.token_bytes(16)
+# Pre-match bot cutoff: three or more real humans play without the bot.
+BOT_PREMATCH_EXIT_REAL_PLAYER_COUNT = 3
 
 
 def check_value(value, check):
@@ -62,9 +66,16 @@ class MatchmakeParticipant:
 
 
 class MatchmakeSession:
-	def __init__(self, session):
+	def __init__(self, session, bot_mode=None):
 		self.session = session
 		self.participants = {}
+		self.bot_pids = set()
+		self.expected_bot_pids = set()
+		self.bot_mode = bot_mode
+		self.bots_suppressed = False
+
+	def real_pids(self):
+		return [pid for pid in self.participants if pid not in self.bot_pids]
 		
 	def check(self, crit):
 		return check_search_criteria(self.session, crit)
@@ -142,9 +153,18 @@ class MatchMaker:
 		session.owner = pid
 		session.started_time = common.DateTime.now()
 		
-		self.sessions[session.id] = MatchmakeSession(session)
-		
-		await self.eagle.start(session.id)
+		bot_mode = bot_modes.for_game_mode(session.game_mode)
+		self.sessions[session.id] = MatchmakeSession(session, bot_mode)
+		logger.info(
+			"Created match session=%i game_mode=%i participants=%i/%i bot_mode=%s",
+			session.id,
+			session.game_mode,
+			self.sessions[session.id].session.num_participants,
+			session.max_participants,
+			bot_mode.name if bot_mode else "disabled"
+		)
+
+		await self.eagle.start(session.id, bot_mode)
 	
 	async def destroy(self, session, pid):
 		event = notification.NotificationEvent()
@@ -156,9 +176,28 @@ class MatchMaker:
 		del self.sessions[session.session.id]
 		await self.eagle.stop(session.session.id)
 	
-	async def join(self, gid, pid, message, participants):
+	async def join(self, gid, pid, message, participants, bot_param=None):
 		session = self.get(gid)
 		session.join(pid, message, participants)
+
+		if pid in session.expected_bot_pids:
+			session.bot_pids.add(pid)
+			logger.info("Bot NEX matchmaking joined session=%i pid=%i", gid, pid)
+		elif (
+			session.bot_mode and not session.expected_bot_pids
+			and not session.bots_suppressed
+		):
+			# Authenticate the bot now, but let its own NEX client perform the
+			# same auto-matchmake RMC request as a real second player. Directly
+			# inserting a server-side participant leaves an observable gap in the
+			# host's matchmaking state machine.
+			if bot_param is None:
+				raise RuntimeError("Missing auto-matchmake parameters for bot join")
+			bot_pids = await self.eagle.prepare_bots(gid)
+			session.expected_bot_pids.update(bot_pids)
+			await self.eagle.begin_bot_matchmaking(gid, bot_param)
+
+		await self.dismiss_bots_for_pre_match_cutoff(session)
 		
 		event = notification.NotificationEvent()
 		event.pid = pid
@@ -169,7 +208,7 @@ class MatchMaker:
 		event.text = message
 		
 		await self.clients.send_notification(session.session.owner, event)
-		
+
 		payload = {
 			"expires_at": "%i" %(time.time() + 10800),
 			"server_env": "lp1",
@@ -193,18 +232,43 @@ class MatchMaker:
 		event.type = 200000
 		event.param1 = gid
 		event.map = {
-			"url": "wss://smb35.ymar.dev:20001/%i" %gid,
+			"url": "wss://%s:%i/%i" %(config.EAGLE_PUBLIC_HOST, config.EAGLE_PORT, gid),
 			"token": base64.b64encode(token.encode()).decode()
 		}
 		
 		await self.clients.send_notification(pid, event)
+
+	async def dismiss_bots_for_pre_match_cutoff(self, session):
+		"""Remove bots from the lobby before StartRound when humans meet the cutoff."""
+
+		real_player_count = len(session.real_pids())
+		if real_player_count < BOT_PREMATCH_EXIT_REAL_PLAYER_COUNT:
+			return
+		if not session.bot_pids and session.bots_suppressed:
+			return
+
+		# Do this while the gathering is still a lobby.  Removing a participant
+		# from StartRound itself can invalidate the clients' already-built round
+		# state, which is why the cutoff belongs here rather than in start_round().
+		session.bots_suppressed = True
+		bot_pids = tuple(session.bot_pids)
+		logger.info(
+			"BOT_PREMATCH_EXIT session=%i real_players=%i threshold=%i bots=%s",
+			session.session.id, real_player_count,
+			BOT_PREMATCH_EXIT_REAL_PLAYER_COUNT, list(bot_pids)
+		)
+		for pid in bot_pids:
+			if pid in session.participants:
+				await self.leave(session.session.id, pid)
+			session.bot_pids.discard(pid)
+		await self.eagle.dismiss_bots_before_round(session.session.id)
 	
 	async def leave(self, gid, pid, message="", disconnected=False):
 		session = self.get(gid)
 		session.leave(pid)
 		
 		if pid == session.session.owner:
-			if session.session.flags & 0x10 and session.participants:
+			if session.session.flags & 0x10 and session.real_pids():
 				await self.migrate(session)
 			else:
 				await self.destroy(session, pid)
@@ -219,7 +283,7 @@ class MatchMaker:
 			await self.clients.send_notification(session.session.owner, event)
 	
 	async def migrate(self, session):
-		new_owner = random.choice(list(session.participants))
+		new_owner = random.choice(session.real_pids())
 		
 		event = notification.NotificationEvent()
 		event.type = 4000
@@ -341,7 +405,10 @@ class MatchmakeExtensionServer(matchmaking.MatchmakeExtensionServer):
 			await self.matchmaker.create(param.session, client.pid())
 			session = param.session
 		
-		await self.matchmaker.join(session.id, client.pid(), param.join_message, param.num_participants)
+		await self.matchmaker.join(
+			session.id, client.pid(), param.join_message, param.num_participants,
+			param
+		)
 		return session
 
 
@@ -390,9 +457,43 @@ class MatchmakeRefereeServer(matchmaking.MatchmakeRefereeServer):
 		if not gathering:
 			raise common.RMCError("MatchmakeReferee::NotParticipatedGathering")
 		
+		logger.info(
+			"BOT_ROUND session=%i requester=%i requested_pids=%s participants=%s bots=%s",
+			param.gid, client.pid(), list(param.pids),
+			list(gathering.participants), list(gathering.bot_pids)
+		)
+
 		for pid in param.pids:
 			if pid not in gathering.participants:
 				raise common.RMCError("MatchmakeReferee::NotParticipatedGathering")
+
+		real_player_count = len(gathering.real_pids())
+		# A started round must no longer accept matchmaking participants.  Otherwise
+		# a late client can receive the live Eagle endpoint after the initial player
+		# list is fixed, which its game client cannot join safely.
+		gathering.session.open_participation = False
+		logger.info(
+			"BOT_ROUND session=%i locked gathering for %i real player(s)",
+			param.gid, real_player_count
+		)
+
+		# The game assigns Eagle player slots from StartRoundParam.pids, not just
+		# from the matchmaking participant list.  The controlled server bot has
+		# no PRUDP client to submit this request itself, so append it here after
+		# validation.  Keeping the real host first makes it Eagle player 0; the
+		# bot's loopback Eagle peer then owns player 1.
+		for pid in gathering.bot_pids:
+			if pid not in param.pids:
+				param.pids.append(pid)
+		logger.info("BOT_ROUND session=%i stored_pids=%s", param.gid, list(param.pids))
+
+		# Eagle player ids are only seven bits and must not collide with human
+		# players.  All genuine participants have joined by round start, so this
+		# is the last safe point to reserve the following ids for server bots.
+		self.matchmaker.eagle.set_bot_player_offset(
+			param.gid,
+			real_player_count
+		)
 		
 		round_id = next(self.round_id)
 		self.rounds[round_id] = param
@@ -403,6 +504,12 @@ class MatchmakeRefereeServer(matchmaking.MatchmakeRefereeServer):
 		event.param1 = round_id
 		for pid in param.pids:
 			await self.clients.send_notification(pid, event)
+
+		# The bot must consume the normal 116000 notification and request this
+		# StartRoundParam through its own authenticated NEX connection before it
+		# attaches to Eagle. This is the real-client lifecycle the host validates.
+		if gathering.bot_pids:
+			await self.matchmaker.eagle.prepare_bot_round(param.gid, round_id)
 		
 		return round_id
 	
@@ -427,6 +534,13 @@ class MessageDeliveryServer(messaging.MessageDeliveryServer):
 		self.matchmaker = matchmaker
 	
 	async def deliver_message(self, client, message):
+		if config.EAGLE_TRACE:
+			fields = {
+				name: getattr(message, name)
+				for name in ("recipient", "subject", "body", "data", "payload")
+				if hasattr(message, name)
+			}
+			logger.info("NEX_MESSAGE sender=%i fields=%r", client.pid(), fields)
 		message.sender = client.pid()
 		message.sender_name = str(client.pid())
 		message.reception_time = common.DateTime.now()
@@ -522,7 +636,7 @@ async def main():
 	context = tls.TLSContext()
 	context.set_certificate_chain(chain, key)
 	
-	async with eagle.serve("", 20001, context) as eagle_mgr:
+	async with eagle.serve("", config.EAGLE_PORT, context, s, config.EAGLE_INTERNAL_HOST) as eagle_mgr:
 		clients = ClientMgr()
 		matchmaker = MatchMaker(clients, eagle_mgr)
 		async with dashboard.serve("", 20002, context, clients, matchmaker):

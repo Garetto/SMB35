@@ -1,3 +1,6 @@
 
 __pycache__/
 resources/*
+source/resources/
+source/main.py.bak
+source/local_config.py
